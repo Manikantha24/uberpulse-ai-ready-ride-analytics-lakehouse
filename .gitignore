@@ -1,0 +1,22 @@
+﻿# Python cache and test artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+
+# Local datasets and generated outputs
+/data/raw/
+/data/processed/
+
+# Logs
+/logs/
+*.log
+
+# Secrets and local environment settings
+.env
+.env.*
+!.env.example
+secrets.json
