@@ -1,16 +1,20 @@
 
 from pathlib import Path
+from datetime import datetime, timezone
 import argparse
+import json
 import logging
 import subprocess
 import sys
 import time
+import uuid
 
 import pyarrow.parquet as pq
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 LOG_FILE = PROJECT_ROOT / "logs" / "pipeline_demo.log"
+REPORT_FILE = PROJECT_ROOT / "logs" / "pipeline_run_report.json"
 
 PIPELINE_STEPS = [
     (
@@ -26,6 +30,11 @@ PIPELINE_STEPS = [
         PROJECT_ROOT / "src" / "transformation" / "transform_trips.py",
     ),
 ]
+
+
+def utc_now() -> str:
+    """Return the current UTC timestamp in ISO 8601 format."""
+    return datetime.now(timezone.utc).isoformat()
 
 
 def configure_logging() -> logging.Logger:
@@ -64,7 +73,7 @@ def configure_logging() -> logging.Logger:
 
 
 def log_child_output(step_name: str, line: str) -> None:
-    """Persist child-process output to the log without duplicating console output."""
+    """Write child-process output to the log without duplicating console output."""
     logger = logging.getLogger("uberpulse")
     message = line.rstrip("\r\n")
 
@@ -84,6 +93,23 @@ def log_child_output(step_name: str, line: str) -> None:
     for handler in logger.handlers:
         if isinstance(handler, logging.FileHandler):
             handler.handle(record)
+
+
+def write_run_report(report: dict) -> None:
+    """Write the latest pipeline run report as formatted JSON."""
+    REPORT_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+    temporary_file = REPORT_FILE.with_suffix(".json.tmp")
+    try:
+        with temporary_file.open("w", encoding="utf-8") as file:
+            json.dump(report, file, indent=2, ensure_ascii=False)
+            file.write("\n")
+
+        # Replace the previous report only after the new report is complete.
+        temporary_file.replace(REPORT_FILE)
+    finally:
+        if temporary_file.exists():
+            temporary_file.unlink()
 
 
 def parse_args() -> argparse.Namespace:
@@ -173,7 +199,7 @@ def run_step(
     max_attempts: int = 3,
     retry_delay_seconds: float = 1.0,
 ) -> float:
-    """Run a pipeline step, retrying transient process-launch failures."""
+    """Run a step, retrying transient process-launch failures."""
     logger = logging.getLogger("uberpulse")
 
     if max_attempts < 1:
@@ -186,13 +212,11 @@ def run_step(
     logger.info("Script: %s", script_path)
 
     if not script_path.exists():
-        logger.error("Pipeline script not found: %s", script_path)
         raise FileNotFoundError(
             f"Pipeline script not found: {script_path}"
         )
 
     command = [sys.executable, "-u", str(script_path)]
-
     if extra_args:
         command.extend(extra_args)
 
@@ -270,16 +294,17 @@ def run_step(
         elapsed = time.perf_counter() - step_start_time
 
         if return_code != 0:
+            message = (
+                f"{step_name} failed with exit code "
+                f"{return_code}. Pipeline stopped."
+            )
             logger.error(
                 "Step failed: %s | Duration: %.2f seconds | Exit code: %s",
                 step_name,
                 elapsed,
                 return_code,
             )
-            raise RuntimeError(
-                f"{step_name} failed with exit code "
-                f"{return_code}. Pipeline stopped."
-            )
+            raise RuntimeError(message)
 
         logger.info(
             "Step completed successfully: %s | Duration: %.2f seconds",
@@ -288,9 +313,7 @@ def run_step(
         )
         return elapsed
 
-    raise RuntimeError(
-        f"Step failed unexpectedly: {step_name}"
-    )
+    raise RuntimeError(f"Step failed unexpectedly: {step_name}")
 
 
 def print_pipeline_summary(
@@ -317,7 +340,6 @@ def print_pipeline_summary(
             f"{result['step']}: {result['status']} "
             f"({duration_text})"
         )
-
         print(summary_line, flush=True)
         logger.info("Step summary: %s", summary_line)
 
@@ -333,9 +355,13 @@ def print_pipeline_summary(
 
 
 def main() -> None:
-    """Run the pipeline and report execution and output metrics."""
+    """Run the pipeline and write a structured report for the run."""
     logger = configure_logging()
     args = parse_args()
+
+    run_id = str(uuid.uuid4())
+    started_at = utc_now()
+    pipeline_start = time.perf_counter()
 
     input_file = args.input.resolve()
     valid_output = args.valid_output.resolve()
@@ -360,19 +386,22 @@ def main() -> None:
         ],
     ]
 
+    step_results: list[dict[str, str | float | None]] = []
+    failure_details: dict[str, str] | None = None
+
     print("UBERPULSE - LOCAL DATA PIPELINE", flush=True)
+    print(f"Run ID: {run_id}", flush=True)
     print(f"Project root: {PROJECT_ROOT}", flush=True)
     print(f"Input file: {input_file}", flush=True)
     print(f"Log file: {LOG_FILE}", flush=True)
+    print(f"Run report: {REPORT_FILE}", flush=True)
 
     logger.info("=" * 60)
-    logger.info("UberPulse pipeline run started")
+    logger.info("UberPulse pipeline run started | Run ID: %s", run_id)
     logger.info("Project root: %s", PROJECT_ROOT)
     logger.info("Input file: %s", input_file)
     logger.info("Log file: %s", LOG_FILE)
-
-    pipeline_start = time.perf_counter()
-    step_results: list[dict[str, str | float | None]] = []
+    logger.info("Run report: %s", REPORT_FILE)
 
     try:
         for (step_name, script_path), extra_args in zip(
@@ -388,14 +417,15 @@ def main() -> None:
                     script_path,
                     extra_args,
                 )
-            except (FileNotFoundError, RuntimeError):
+            except Exception as error:
+                elapsed = time.perf_counter() - step_start
                 step_results.append(
                     {
                         "step": step_name,
                         "status": "FAILED",
-                        "duration_seconds": (
-                            time.perf_counter() - step_start
-                        ),
+                        "duration_seconds": round(elapsed, 3),
+                        "error_type": type(error).__name__,
+                        "error_message": str(error),
                     }
                 )
                 raise
@@ -404,30 +434,63 @@ def main() -> None:
                 {
                     "step": step_name,
                     "status": "SUCCESS",
-                    "duration_seconds": elapsed,
+                    "duration_seconds": round(elapsed, 3),
                 }
             )
 
-    except (FileNotFoundError, RuntimeError) as error:
+    except Exception as error:
+        failure_details = {
+            "step": (
+                str(step_results[-1]["step"])
+                if step_results and step_results[-1]["status"] == "FAILED"
+                else "Pipeline"
+            ),
+            "error_type": type(error).__name__,
+            "error_message": str(error),
+        }
         logger.exception("Pipeline stopped because a step failed")
         print(f"\nPIPELINE FAILED: {error}", flush=True)
 
-        print_pipeline_summary(
-            step_results,
-            time.perf_counter() - pipeline_start,
-            success=False,
-        )
-
-        logger.info("Pipeline run ended with failure")
-        sys.exit(1)
-
     total_elapsed = time.perf_counter() - pipeline_start
+    success = failure_details is None
+    ended_at = utc_now()
 
     print_pipeline_summary(
         step_results,
         total_elapsed,
-        success=True,
+        success,
     )
+
+    report = {
+        "run_id": run_id,
+        "status": "SUCCESS" if success else "FAILED",
+        "started_at_utc": started_at,
+        "ended_at_utc": ended_at,
+        "duration_seconds": round(total_elapsed, 3),
+        "input_file": str(input_file),
+        "log_file": str(LOG_FILE),
+        "steps": step_results,
+        "failure": failure_details,
+    }
+
+    try:
+        write_run_report(report)
+        logger.info(
+            "Structured run report written: %s",
+            REPORT_FILE,
+        )
+    except OSError:
+        logger.exception("Could not write the pipeline run report")
+        print(
+            f"WARNING: Could not write run report: {REPORT_FILE}",
+            flush=True,
+        )
+        if success:
+            sys.exit(1)
+
+    if not success:
+        logger.error("Run %s ended with failure", run_id)
+        sys.exit(1)
 
     print("\nOutput metrics:", flush=True)
     logger.info("Collecting output file metrics")

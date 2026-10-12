@@ -246,3 +246,90 @@ def test_pipeline_failure_stops_execution(monkeypatch, tmp_path):
         "1. Raw data inspection",
         "2. Data validation",
     ]
+    
+def test_write_run_report_creates_valid_json(monkeypatch, tmp_path):
+    import json
+    from src.pipeline import run_pipeline
+
+    report_path = tmp_path / "pipeline_run_report.json"
+    monkeypatch.setattr(run_pipeline, "REPORT_FILE", report_path)
+
+    report = {
+        "run_id": "test-run-001",
+        "status": "SUCCESS",
+        "started_at_utc": "2026-10-13T00:00:00+00:00",
+        "ended_at_utc": "2026-10-13T00:00:02+00:00",
+        "duration_seconds": 2.0,
+        "input_file": "sample.parquet",
+        "log_file": "pipeline_demo.log",
+        "steps": [
+            {
+                "step": "1. Raw data inspection",
+                "status": "SUCCESS",
+                "duration_seconds": 1.0,
+            }
+        ],
+        "failure": None,
+    }
+
+    run_pipeline.write_run_report(report)
+
+    assert report_path.exists()
+
+    saved_report = json.loads(
+        report_path.read_text(encoding="utf-8")
+    )
+
+    assert saved_report["run_id"] == "test-run-001"
+    assert saved_report["status"] == "SUCCESS"
+    assert saved_report["failure"] is None
+    assert saved_report["steps"][0]["status"] == "SUCCESS"
+
+
+def test_write_run_report_preserves_failure_details(
+    monkeypatch,
+    tmp_path,
+):
+    import json
+    from src.pipeline import run_pipeline
+
+    report_path = tmp_path / "pipeline_run_report.json"
+    monkeypatch.setattr(run_pipeline, "REPORT_FILE", report_path)
+
+    report = {
+        "run_id": "test-run-002",
+        "status": "FAILED",
+        "started_at_utc": "2026-10-13T00:00:00+00:00",
+        "ended_at_utc": "2026-10-13T00:00:01+00:00",
+        "duration_seconds": 1.0,
+        "input_file": "sample.parquet",
+        "log_file": "pipeline_demo.log",
+        "steps": [
+            {
+                "step": "2. Data validation",
+                "status": "FAILED",
+                "duration_seconds": 0.5,
+                "error_type": "RuntimeError",
+                "error_message": "Simulated validation failure",
+            }
+        ],
+        "failure": {
+            "step": "2. Data validation",
+            "error_type": "RuntimeError",
+            "error_message": "Simulated validation failure",
+        },
+    }
+
+    run_pipeline.write_run_report(report)
+
+    saved_report = json.loads(
+        report_path.read_text(encoding="utf-8")
+    )
+
+    assert saved_report["status"] == "FAILED"
+    assert saved_report["failure"]["step"] == "2. Data validation"
+    assert saved_report["failure"]["error_type"] == "RuntimeError"
+    assert (
+        saved_report["failure"]["error_message"]
+        == "Simulated validation failure"
+    )
