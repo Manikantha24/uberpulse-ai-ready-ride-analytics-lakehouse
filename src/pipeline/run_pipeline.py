@@ -29,14 +29,13 @@ PIPELINE_STEPS = [
 
 
 def configure_logging() -> logging.Logger:
-    """Configure consistent UTF-8 logging to the console and a fresh file."""
+    """Configure console and UTF-8 file logging for each pipeline run."""
     LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
 
     logger = logging.getLogger("uberpulse")
     logger.setLevel(logging.INFO)
     logger.propagate = False
 
-    # Close existing handlers to prevent duplicate messages.
     for handler in logger.handlers[:]:
         handler.close()
         logger.removeHandler(handler)
@@ -50,7 +49,6 @@ def configure_logging() -> logging.Logger:
     console_handler.setLevel(logging.INFO)
     console_handler.setFormatter(formatter)
 
-    # Write UTF-8 and overwrite the previous run's log.
     file_handler = logging.FileHandler(
         LOG_FILE,
         mode="w",
@@ -63,6 +61,33 @@ def configure_logging() -> logging.Logger:
     logger.addHandler(file_handler)
 
     return logger
+
+
+def log_child_output(step_name: str, line: str) -> None:
+    """Write child-process output to the log file without duplicating it
+    on the console.
+    """
+    logger = logging.getLogger("uberpulse")
+    message = line.rstrip("\r\n")
+
+    if not message:
+        return
+
+    record = logger.makeRecord(
+        logger.name,
+        logging.INFO,
+        "",
+        0,
+        "CHILD OUTPUT [%s] %s",
+        (step_name, message),
+        None,
+    )
+
+    # The line is already printed directly to the terminal.
+    # Send this record only to the file handler.
+    for handler in logger.handlers:
+        if isinstance(handler, logging.FileHandler):
+            handler.handle(record)
 
 
 def parse_args() -> argparse.Namespace:
@@ -139,7 +164,7 @@ def run_step(
     script_path: Path,
     extra_args: list[str] | None = None,
 ) -> float:
-    """Run one pipeline script and return its duration; raise on failure."""
+    """Run one step, stream its output, and return its duration."""
     logger = logging.getLogger("uberpulse")
 
     logger.info("Starting step: %s", step_name)
@@ -151,22 +176,43 @@ def run_step(
             f"Pipeline script not found: {script_path}"
         )
 
-    command = [sys.executable, str(script_path)]
+    command = [sys.executable, "-u", str(script_path)]
     if extra_args:
         command.extend(extra_args)
 
     start_time = time.perf_counter()
 
     try:
-        result = subprocess.run(
+        process = subprocess.Popen(
             command,
             cwd=PROJECT_ROOT,
-            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
         )
-    except OSError:
+
+        if process.stdout is None:
+            raise RuntimeError(
+                f"Could not capture output from {step_name}."
+            )
+
+        with process.stdout:
+            for line in process.stdout:
+                # Preserve the child script's output in the terminal.
+                print(line, end="", flush=True)
+
+                # Also persist each line in the central log.
+                log_child_output(step_name, line)
+
+        return_code = process.wait()
+
+    except (OSError, RuntimeError):
         elapsed = time.perf_counter() - start_time
         logger.exception(
-            "Could not launch step '%s' after %.2f seconds",
+            "Could not run or capture step '%s' after %.2f seconds",
             step_name,
             elapsed,
         )
@@ -174,16 +220,16 @@ def run_step(
 
     elapsed = time.perf_counter() - start_time
 
-    if result.returncode != 0:
+    if return_code != 0:
         logger.error(
             "Step failed: %s | Duration: %.2f seconds | Exit code: %s",
             step_name,
             elapsed,
-            result.returncode,
+            return_code,
         )
         raise RuntimeError(
             f"{step_name} failed with exit code "
-            f"{result.returncode}. Pipeline stopped."
+            f"{return_code}. Pipeline stopped."
         )
 
     logger.info(
