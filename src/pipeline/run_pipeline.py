@@ -64,9 +64,7 @@ def configure_logging() -> logging.Logger:
 
 
 def log_child_output(step_name: str, line: str) -> None:
-    """Write child-process output to the log file without duplicating it
-    on the console.
-    """
+    """Persist child-process output to the log without duplicating console output."""
     logger = logging.getLogger("uberpulse")
     message = line.rstrip("\r\n")
 
@@ -83,63 +81,72 @@ def log_child_output(step_name: str, line: str) -> None:
         None,
     )
 
-    # The line is already printed directly to the terminal.
-    # Send this record only to the file handler.
     for handler in logger.handlers:
         if isinstance(handler, logging.FileHandler):
             handler.handle(record)
 
 
 def parse_args() -> argparse.Namespace:
-    """Parse optional input and output paths for a pipeline run."""
+    """Parse configurable pipeline input and output paths."""
     parser = argparse.ArgumentParser(
         description="Run the UberPulse local data pipeline."
     )
+
     parser.add_argument(
         "--input",
         type=Path,
-        default=PROJECT_ROOT
-        / "data"
-        / "raw"
-        / "yellow_tripdata_2025-01.parquet",
+        default=(
+            PROJECT_ROOT
+            / "data"
+            / "raw"
+            / "yellow_tripdata_2025-01.parquet"
+        ),
         help="Path to the source Parquet file.",
     )
     parser.add_argument(
         "--valid-output",
         type=Path,
-        default=PROJECT_ROOT
-        / "data"
-        / "processed"
-        / "yellow_tripdata_2025-01_valid.parquet",
+        default=(
+            PROJECT_ROOT
+            / "data"
+            / "processed"
+            / "yellow_tripdata_2025-01_valid.parquet"
+        ),
         help="Path for validated records.",
     )
     parser.add_argument(
         "--quarantine-output",
         type=Path,
-        default=PROJECT_ROOT
-        / "data"
-        / "processed"
-        / "yellow_tripdata_2025-01_quarantine.parquet",
+        default=(
+            PROJECT_ROOT
+            / "data"
+            / "processed"
+            / "yellow_tripdata_2025-01_quarantine.parquet"
+        ),
         help="Path for quarantined records.",
     )
     parser.add_argument(
         "--analytics-output",
         type=Path,
-        default=PROJECT_ROOT
-        / "data"
-        / "processed"
-        / "yellow_tripdata_2025-01_analytics.parquet",
+        default=(
+            PROJECT_ROOT
+            / "data"
+            / "processed"
+            / "yellow_tripdata_2025-01_analytics.parquet"
+        ),
         help="Path for transformed analytics records.",
     )
+
     return parser.parse_args()
 
 
-def get_parquet_metrics(
-    file_path: Path,
-) -> dict[str, int | float | str]:
-    """Return basic file-size, row-count, and column-count metrics."""
+def get_parquet_metrics(file_path: Path) -> dict[str, int | float | str]:
+    """Return row count, column count, and size for a Parquet file."""
     if not file_path.exists():
-        return {"path": str(file_path), "status": "missing"}
+        return {
+            "path": str(file_path),
+            "status": "missing",
+        }
 
     metrics: dict[str, int | float | str] = {
         "path": str(file_path),
@@ -163,9 +170,17 @@ def run_step(
     step_name: str,
     script_path: Path,
     extra_args: list[str] | None = None,
+    max_attempts: int = 3,
+    retry_delay_seconds: float = 1.0,
 ) -> float:
-    """Run one step, stream its output, and return its duration."""
+    """Run a pipeline step, retrying transient process-launch failures."""
     logger = logging.getLogger("uberpulse")
+
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be at least 1.")
+
+    if retry_delay_seconds < 0:
+        raise ValueError("retry_delay_seconds cannot be negative.")
 
     logger.info("Starting step: %s", step_name)
     logger.info("Script: %s", script_path)
@@ -177,67 +192,105 @@ def run_step(
         )
 
     command = [sys.executable, "-u", str(script_path)]
+
     if extra_args:
         command.extend(extra_args)
 
-    start_time = time.perf_counter()
+    step_start_time = time.perf_counter()
 
-    try:
-        process = subprocess.Popen(
-            command,
-            cwd=PROJECT_ROOT,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
+    for attempt in range(1, max_attempts + 1):
+        logger.info(
+            "Step attempt %s/%s: %s",
+            attempt,
+            max_attempts,
+            step_name,
         )
 
-        if process.stdout is None:
-            raise RuntimeError(
-                f"Could not capture output from {step_name}."
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=PROJECT_ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+            )
+        except OSError:
+            logger.exception(
+                "Could not launch step '%s' on attempt %s/%s",
+                step_name,
+                attempt,
+                max_attempts,
             )
 
-        with process.stdout:
-            for line in process.stdout:
-                # Preserve the child script's output in the terminal.
-                print(line, end="", flush=True)
+            if attempt == max_attempts:
+                logger.error(
+                    "Step exhausted all %s attempts: %s",
+                    max_attempts,
+                    step_name,
+                )
+                raise
 
-                # Also persist each line in the central log.
-                log_child_output(step_name, line)
+            logger.warning(
+                "Retrying step '%s' in %.2f seconds",
+                step_name,
+                retry_delay_seconds,
+            )
+            time.sleep(retry_delay_seconds)
+            continue
 
-        return_code = process.wait()
+        try:
+            if process.stdout is None:
+                process.kill()
+                process.wait()
+                raise RuntimeError(
+                    f"Could not capture output from {step_name}."
+                )
 
-    except (OSError, RuntimeError):
-        elapsed = time.perf_counter() - start_time
-        logger.exception(
-            "Could not run or capture step '%s' after %.2f seconds",
+            with process.stdout:
+                for line in process.stdout:
+                    print(line, end="", flush=True)
+                    log_child_output(step_name, line)
+
+            return_code = process.wait()
+
+        except (OSError, RuntimeError):
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+
+            logger.exception(
+                "Could not capture output from step '%s'",
+                step_name,
+            )
+            raise
+
+        elapsed = time.perf_counter() - step_start_time
+
+        if return_code != 0:
+            logger.error(
+                "Step failed: %s | Duration: %.2f seconds | Exit code: %s",
+                step_name,
+                elapsed,
+                return_code,
+            )
+            raise RuntimeError(
+                f"{step_name} failed with exit code "
+                f"{return_code}. Pipeline stopped."
+            )
+
+        logger.info(
+            "Step completed successfully: %s | Duration: %.2f seconds",
             step_name,
             elapsed,
         )
-        raise
+        return elapsed
 
-    elapsed = time.perf_counter() - start_time
-
-    if return_code != 0:
-        logger.error(
-            "Step failed: %s | Duration: %.2f seconds | Exit code: %s",
-            step_name,
-            elapsed,
-            return_code,
-        )
-        raise RuntimeError(
-            f"{step_name} failed with exit code "
-            f"{return_code}. Pipeline stopped."
-        )
-
-    logger.info(
-        "Step completed successfully: %s | Duration: %.2f seconds",
-        step_name,
-        elapsed,
+    raise RuntimeError(
+        f"Step failed unexpectedly: {step_name}"
     )
-    return elapsed
 
 
 def print_pipeline_summary(
@@ -245,7 +298,7 @@ def print_pipeline_summary(
     total_elapsed: float,
     success: bool,
 ) -> None:
-    """Print and log the pipeline summary."""
+    """Print and log the pipeline execution summary."""
     logger = logging.getLogger("uberpulse")
 
     print(f"\n{'=' * 70}", flush=True)
@@ -264,6 +317,7 @@ def print_pipeline_summary(
             f"{result['step']}: {result['status']} "
             f"({duration_text})"
         )
+
         print(summary_line, flush=True)
         logger.info("Step summary: %s", summary_line)
 
@@ -279,6 +333,7 @@ def print_pipeline_summary(
 
 
 def main() -> None:
+    """Run the pipeline and report execution and output metrics."""
     logger = configure_logging()
     args = parse_args()
 
@@ -392,13 +447,19 @@ def main() -> None:
                 f"Size: {metrics['size_mb']:.2f} MB"
             )
             print(f"    {details}", flush=True)
-            logger.info("Output metrics: %s | %s", output_file, details)
-
+            logger.info(
+                "Output metrics: %s | %s",
+                output_file,
+                details,
+            )
         elif "size_mb" in metrics:
             details = f"Size: {metrics['size_mb']:.2f} MB"
             print(f"    {details}", flush=True)
-            logger.info("Output metrics: %s | %s", output_file, details)
-
+            logger.info(
+                "Output metrics: %s | %s",
+                output_file,
+                details,
+            )
         else:
             reason = metrics.get(
                 "status",

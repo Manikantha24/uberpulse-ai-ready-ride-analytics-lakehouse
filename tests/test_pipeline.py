@@ -1,6 +1,8 @@
+
 import subprocess
 import sys
 from pathlib import Path
+from io import StringIO
 
 import pandas as pd
 import pytest
@@ -114,6 +116,97 @@ def test_pipeline_runner_completes_successfully(sample_input_file, tmp_path):
     assert len(analytics_df) == len(valid_df)
 
 
+def test_run_step_retries_after_process_launch_error(monkeypatch, tmp_path):
+    from src.pipeline import run_pipeline
+
+    script = tmp_path / "fake_script.py"
+    script.write_text("print('success')", encoding="utf-8")
+
+    attempts = []
+
+    class FakeProcess:
+        def __init__(self):
+            self.stdout = StringIO("success\n")
+
+        def wait(self):
+            return 0
+
+        def poll(self):
+            return 0
+
+    def fake_popen(*args, **kwargs):
+        attempts.append(1)
+
+        if len(attempts) == 1:
+            raise OSError("Simulated temporary process-launch failure")
+
+        return FakeProcess()
+
+    monkeypatch.setattr(run_pipeline.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(run_pipeline.time, "sleep", lambda _: None)
+    monkeypatch.setattr(run_pipeline, "log_child_output", lambda *_: None)
+
+    elapsed = run_pipeline.run_step(
+        "Retry test",
+        script,
+        max_attempts=3,
+        retry_delay_seconds=0,
+    )
+
+    assert elapsed >= 0
+    assert len(attempts) == 2
+
+
+def test_run_step_stops_after_retry_attempts_are_exhausted(
+    monkeypatch,
+    tmp_path,
+):
+    from src.pipeline import run_pipeline
+
+    script = tmp_path / "fake_script.py"
+    script.write_text("print('unused')", encoding="utf-8")
+
+    attempts = []
+
+    def fake_popen(*args, **kwargs):
+        attempts.append(1)
+        raise OSError("Simulated process-launch failure")
+
+    monkeypatch.setattr(run_pipeline.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(run_pipeline.time, "sleep", lambda _: None)
+
+    with pytest.raises(OSError, match="Simulated process-launch failure"):
+        run_pipeline.run_step(
+            "Retry exhaustion test",
+            script,
+            max_attempts=3,
+            retry_delay_seconds=0,
+        )
+
+    assert len(attempts) == 3
+
+
+def test_run_step_rejects_invalid_retry_configuration(tmp_path):
+    from src.pipeline import run_pipeline
+
+    script = tmp_path / "fake_script.py"
+    script.write_text("print('unused')", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="max_attempts"):
+        run_pipeline.run_step(
+            "Invalid retry test",
+            script,
+            max_attempts=0,
+        )
+
+    with pytest.raises(ValueError, match="retry_delay_seconds"):
+        run_pipeline.run_step(
+            "Invalid delay test",
+            script,
+            retry_delay_seconds=-1,
+        )
+
+
 def test_pipeline_failure_stops_execution(monkeypatch, tmp_path):
     from src.pipeline import run_pipeline
 
@@ -124,6 +217,8 @@ def test_pipeline_failure_stops_execution(monkeypatch, tmp_path):
 
         if len(executed_steps) == 2:
             raise RuntimeError("Simulated validation failure")
+
+        return 0.1
 
     monkeypatch.setattr(run_pipeline, "run_step", fake_run_step)
 
