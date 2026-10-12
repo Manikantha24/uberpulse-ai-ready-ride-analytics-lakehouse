@@ -15,6 +15,7 @@ import pyarrow.parquet as pq
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 LOG_FILE = PROJECT_ROOT / "logs" / "pipeline_demo.log"
 REPORT_FILE = PROJECT_ROOT / "logs" / "pipeline_run_report.json"
+HISTORY_DIR = PROJECT_ROOT / "logs" / "run_history"
 
 PIPELINE_STEPS = [
     (
@@ -96,20 +97,40 @@ def log_child_output(step_name: str, line: str) -> None:
 
 
 def write_run_report(report: dict) -> None:
-    """Write the latest pipeline run report as formatted JSON."""
+    """Save the latest report and preserve a separate historical copy."""
     REPORT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    HISTORY_DIR.mkdir(parents=True, exist_ok=True)
 
-    temporary_file = REPORT_FILE.with_suffix(".json.tmp")
+    run_id = str(report["run_id"])
+    history_file = HISTORY_DIR / f"{run_id}.json"
+
+    if history_file.exists():
+        raise FileExistsError(
+            f"Historical report already exists: {history_file}"
+        )
+
+    temporary_history = HISTORY_DIR / f".{run_id}.json.tmp"
+    temporary_latest = REPORT_FILE.with_name(
+        f".{REPORT_FILE.name}.{run_id}.tmp"
+    )
+
     try:
-        with temporary_file.open("w", encoding="utf-8") as file:
+        with temporary_history.open("x", encoding="utf-8") as file:
             json.dump(report, file, indent=2, ensure_ascii=False)
             file.write("\n")
 
-        # Replace the previous report only after the new report is complete.
-        temporary_file.replace(REPORT_FILE)
+        with temporary_latest.open("x", encoding="utf-8") as file:
+            json.dump(report, file, indent=2, ensure_ascii=False)
+            file.write("\n")
+
+        # Preserve the unique historical report before updating the latest.
+        temporary_history.replace(history_file)
+        temporary_latest.replace(REPORT_FILE)
+
     finally:
-        if temporary_file.exists():
-            temporary_file.unlink()
+        for temporary_file in (temporary_history, temporary_latest):
+            if temporary_file.exists():
+                temporary_file.unlink()
 
 
 def parse_args() -> argparse.Namespace:
@@ -355,7 +376,7 @@ def print_pipeline_summary(
 
 
 def main() -> None:
-    """Run the pipeline and write a structured report for the run."""
+    """Run the pipeline and write latest and historical run reports."""
     logger = configure_logging()
     args = parse_args()
 
@@ -394,14 +415,16 @@ def main() -> None:
     print(f"Project root: {PROJECT_ROOT}", flush=True)
     print(f"Input file: {input_file}", flush=True)
     print(f"Log file: {LOG_FILE}", flush=True)
-    print(f"Run report: {REPORT_FILE}", flush=True)
+    print(f"Latest report: {REPORT_FILE}", flush=True)
+    print(f"History directory: {HISTORY_DIR}", flush=True)
 
     logger.info("=" * 60)
     logger.info("UberPulse pipeline run started | Run ID: %s", run_id)
     logger.info("Project root: %s", PROJECT_ROOT)
     logger.info("Input file: %s", input_file)
     logger.info("Log file: %s", LOG_FILE)
-    logger.info("Run report: %s", REPORT_FILE)
+    logger.info("Latest report: %s", REPORT_FILE)
+    logger.info("History directory: %s", HISTORY_DIR)
 
     try:
         for (step_name, script_path), extra_args in zip(
@@ -439,15 +462,17 @@ def main() -> None:
             )
 
     except Exception as error:
+        failed_step = (
+            str(step_results[-1]["step"])
+            if step_results and step_results[-1]["status"] == "FAILED"
+            else "Pipeline"
+        )
         failure_details = {
-            "step": (
-                str(step_results[-1]["step"])
-                if step_results and step_results[-1]["status"] == "FAILED"
-                else "Pipeline"
-            ),
+            "step": failed_step,
             "error_type": type(error).__name__,
             "error_message": str(error),
         }
+
         logger.exception("Pipeline stopped because a step failed")
         print(f"\nPIPELINE FAILED: {error}", flush=True)
 
@@ -475,18 +500,18 @@ def main() -> None:
 
     try:
         write_run_report(report)
+        logger.info("Latest run report written: %s", REPORT_FILE)
         logger.info(
-            "Structured run report written: %s",
-            REPORT_FILE,
+            "Historical run report written: %s",
+            HISTORY_DIR / f"{run_id}.json",
         )
-    except OSError:
-        logger.exception("Could not write the pipeline run report")
+    except (OSError, TypeError, ValueError, KeyError) as error:
+        logger.exception("Could not write pipeline run report")
         print(
-            f"WARNING: Could not write run report: {REPORT_FILE}",
+            f"ERROR: Could not write pipeline run report: {error}",
             flush=True,
         )
-        if success:
-            sys.exit(1)
+        sys.exit(1)
 
     if not success:
         logger.error("Run %s ended with failure", run_id)

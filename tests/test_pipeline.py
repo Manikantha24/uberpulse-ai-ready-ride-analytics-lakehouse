@@ -253,6 +253,7 @@ def test_write_run_report_creates_valid_json(monkeypatch, tmp_path):
 
     report_path = tmp_path / "pipeline_run_report.json"
     monkeypatch.setattr(run_pipeline, "REPORT_FILE", report_path)
+    monkeypatch.setattr(run_pipeline, "HISTORY_DIR", tmp_path / "run_history")
 
     report = {
         "run_id": "test-run-001",
@@ -295,6 +296,7 @@ def test_write_run_report_preserves_failure_details(
 
     report_path = tmp_path / "pipeline_run_report.json"
     monkeypatch.setattr(run_pipeline, "REPORT_FILE", report_path)
+    monkeypatch.setattr(run_pipeline, "HISTORY_DIR", tmp_path / "run_history")
 
     report = {
         "run_id": "test-run-002",
