@@ -1,4 +1,3 @@
-
 import pandas as pd
 import pytest
 
@@ -14,13 +13,18 @@ WARNING_COLUMNS = [
     "warning_long_duration",
 ]
 
+REQUIRED_COLUMNS = [
+    "tpep_pickup_datetime",
+    "tpep_dropoff_datetime",
+    "trip_distance",
+    "fare_amount",
+    "total_amount",
+]
 
-@pytest.fixture
-def sample_data(tmp_path):
-    """Create a small dataset containing valid, invalid, and warning records."""
-    input_file = tmp_path / "sample_trips.parquet"
 
-    df = pd.DataFrame(
+def make_trip_data():
+    """Return a small dataset containing valid, invalid, and warning records."""
+    return pd.DataFrame(
         {
             "tpep_pickup_datetime": pd.to_datetime(
                 [
@@ -37,7 +41,7 @@ def sample_data(tmp_path):
                     "2025-01-01 10:20:00",  # Valid
                     "2025-01-01 11:00:00",  # Zero duration: quarantine
                     "2025-01-01 12:30:00",  # Valid, warning conditions
-                    "2025-01-01 13:15:00",  # Valid
+                    "2025-01-01 13:15:00",  # Valid, high fare/distance warnings
                     "2025-01-01 14:10:00",  # Valid
                     "2025-01-01 15:30:00",  # Valid
                 ]
@@ -48,13 +52,18 @@ def sample_data(tmp_path):
         }
     )
 
-    df.to_parquet(input_file, index=False)
+
+@pytest.fixture
+def sample_data(tmp_path):
+    """Write the standard synthetic test dataset to Parquet."""
+    input_file = tmp_path / "sample_trips.parquet"
+    make_trip_data().to_parquet(input_file, index=False)
     return input_file
 
 
 @pytest.fixture
 def validation_outputs(tmp_path, sample_data):
-    """Run validation against the small fixture dataset."""
+    """Run validation against the standard fixture dataset."""
     valid_file = tmp_path / "valid.parquet"
     quarantine_file = tmp_path / "quarantine.parquet"
 
@@ -180,6 +189,121 @@ def test_missing_required_column_raises_clear_error(tmp_path):
     with pytest.raises(ValueError, match="Required columns are missing"):
         validate_dataset(
             input_file,
+            tmp_path / "valid.parquet",
+            tmp_path / "quarantine.parquet",
+        )
+
+
+@pytest.mark.parametrize(
+    ("missing_column", "expected_reason"),
+    [
+        ("tpep_pickup_datetime", "missing_pickup_datetime"),
+        ("tpep_dropoff_datetime", "missing_dropoff_datetime"),
+    ],
+)
+def test_missing_timestamp_is_quarantined(
+    tmp_path, missing_column, expected_reason
+):
+    df = make_trip_data().iloc[[0]].copy()
+    df.loc[df.index[0], missing_column] = pd.NaT
+    input_file = tmp_path / f"{missing_column}_missing.parquet"
+    valid_file = tmp_path / "valid.parquet"
+    quarantine_file = tmp_path / "quarantine.parquet"
+    df.to_parquet(input_file, index=False)
+
+    validate_dataset(input_file, valid_file, quarantine_file)
+
+    valid_df = pd.read_parquet(valid_file)
+    quarantine_df = pd.read_parquet(quarantine_file)
+
+    assert len(valid_df) == 0
+    assert len(quarantine_df) == 1
+    assert expected_reason in quarantine_df.iloc[0]["validation_reasons"]
+
+
+def test_negative_trip_distance_is_quarantined(tmp_path):
+    df = make_trip_data().iloc[[0]].copy()
+    df.loc[df.index[0], "trip_distance"] = -1.0
+    input_file = tmp_path / "negative_distance.parquet"
+    valid_file = tmp_path / "valid.parquet"
+    quarantine_file = tmp_path / "quarantine.parquet"
+    df.to_parquet(input_file, index=False)
+
+    validate_dataset(input_file, valid_file, quarantine_file)
+
+    assert len(pd.read_parquet(valid_file)) == 0
+    quarantine_df = pd.read_parquet(quarantine_file)
+    assert len(quarantine_df) == 1
+    assert "negative_trip_distance" in quarantine_df.iloc[0]["validation_reasons"]
+
+
+def test_all_applicable_failure_reasons_are_preserved(tmp_path):
+    df = make_trip_data().iloc[[0]].copy()
+    row_index = df.index[0]
+    df.loc[row_index, "tpep_pickup_datetime"] = pd.NaT
+    df.loc[row_index, "trip_distance"] = -2.0
+    df.loc[row_index, "fare_amount"] = float("nan")
+    input_file = tmp_path / "multiple_failures.parquet"
+    valid_file = tmp_path / "valid.parquet"
+    quarantine_file = tmp_path / "quarantine.parquet"
+    df.to_parquet(input_file, index=False)
+
+    validate_dataset(input_file, valid_file, quarantine_file)
+
+    quarantine_df = pd.read_parquet(quarantine_file)
+    assert len(quarantine_df) == 1
+    reasons = quarantine_df.iloc[0]["validation_reasons"]
+
+    assert "missing_pickup_datetime" in reasons
+    assert "negative_trip_distance" in reasons
+    assert "missing_fare_amount" in reasons
+
+
+def test_warning_flags_are_preserved_on_quarantined_records(tmp_path):
+    df = make_trip_data().iloc[[0]].copy()
+    row_index = df.index[0]
+    df.loc[row_index, "trip_distance"] = -1.0
+    df.loc[row_index, "fare_amount"] = -5.0
+    input_file = tmp_path / "warning_and_failure.parquet"
+    valid_file = tmp_path / "valid.parquet"
+    quarantine_file = tmp_path / "quarantine.parquet"
+    df.to_parquet(input_file, index=False)
+
+    validate_dataset(input_file, valid_file, quarantine_file)
+
+    quarantine_df = pd.read_parquet(quarantine_file)
+    assert len(quarantine_df) == 1
+    assert bool(quarantine_df.iloc[0]["warning_negative_fare"])
+    assert not bool(quarantine_df.iloc[0]["warning_zero_distance"])
+
+
+def test_empty_dataset_produces_empty_outputs(tmp_path):
+    empty_df = pd.DataFrame(
+        {
+            "tpep_pickup_datetime": pd.Series(dtype="datetime64[ns]"),
+            "tpep_dropoff_datetime": pd.Series(dtype="datetime64[ns]"),
+            "trip_distance": pd.Series(dtype="float64"),
+            "fare_amount": pd.Series(dtype="float64"),
+            "total_amount": pd.Series(dtype="float64"),
+        }
+    )
+    input_file = tmp_path / "empty.parquet"
+    valid_file = tmp_path / "valid.parquet"
+    quarantine_file = tmp_path / "quarantine.parquet"
+    empty_df.to_parquet(input_file, index=False)
+
+    validate_dataset(input_file, valid_file, quarantine_file)
+
+    assert valid_file.exists()
+    assert quarantine_file.exists()
+    assert len(pd.read_parquet(valid_file)) == 0
+    assert len(pd.read_parquet(quarantine_file)) == 0
+
+
+def test_missing_input_file_raises_clear_error(tmp_path):
+    with pytest.raises(FileNotFoundError, match="Raw dataset not found"):
+        validate_dataset(
+            tmp_path / "does_not_exist.parquet",
             tmp_path / "valid.parquet",
             tmp_path / "quarantine.parquet",
         )
