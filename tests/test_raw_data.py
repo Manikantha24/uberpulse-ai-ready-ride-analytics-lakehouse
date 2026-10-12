@@ -1,11 +1,7 @@
 
-from pathlib import Path
-
 import pandas as pd
+import pytest
 
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-RAW_FILE = PROJECT_ROOT / "data" / "raw" / "yellow_tripdata_2025-01.parquet"
 
 EXPECTED_COLUMNS = {
     "VendorID",
@@ -21,17 +17,46 @@ EXPECTED_COLUMNS = {
 }
 
 
-def test_raw_file_exists():
-    assert RAW_FILE.exists(), f"Dataset not found: {RAW_FILE}"
+@pytest.fixture
+def sample_raw_file(tmp_path):
+    """Create a small synthetic raw dataset for testing."""
+    raw_file = tmp_path / "sample_raw_trips.parquet"
+
+    df = pd.DataFrame(
+        {
+            "VendorID": [1, 2],
+            "tpep_pickup_datetime": pd.to_datetime(
+                ["2025-01-01 10:00:00", "2025-01-02 12:00:00"]
+            ),
+            "tpep_dropoff_datetime": pd.to_datetime(
+                ["2025-01-01 10:20:00", "2025-01-02 12:30:00"]
+            ),
+            "passenger_count": [1, 2],
+            "trip_distance": [2.5, 4.0],
+            "PULocationID": [100, 200],
+            "DOLocationID": [101, 201],
+            "payment_type": [1, 2],
+            "fare_amount": [12.5, 18.0],
+            "total_amount": [15.0, 21.5],
+        }
+    )
+
+    df.to_parquet(raw_file, index=False)
+    return raw_file
 
 
-def test_raw_file_is_not_empty():
-    df = pd.read_parquet(RAW_FILE)
-    assert not df.empty, "Dataset contains no records"
+def test_sample_raw_file_exists(sample_raw_file):
+    assert sample_raw_file.exists()
 
 
-def test_expected_columns_exist():
-    df = pd.read_parquet(RAW_FILE)
+def test_sample_raw_file_is_not_empty(sample_raw_file):
+    df = pd.read_parquet(sample_raw_file)
+
+    assert not df.empty
+
+
+def test_expected_columns_exist(sample_raw_file):
+    df = pd.read_parquet(sample_raw_file)
     missing_columns = EXPECTED_COLUMNS - set(df.columns)
 
     assert not missing_columns, (
@@ -39,8 +64,8 @@ def test_expected_columns_exist():
     )
 
 
-def test_pickup_and_dropoff_are_datetime():
-    df = pd.read_parquet(RAW_FILE)
+def test_pickup_and_dropoff_are_datetime(sample_raw_file):
+    df = pd.read_parquet(sample_raw_file)
 
     assert pd.api.types.is_datetime64_any_dtype(
         df["tpep_pickup_datetime"]

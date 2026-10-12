@@ -1,5 +1,6 @@
 
 from pathlib import Path
+import argparse
 import subprocess
 import sys
 import time
@@ -23,7 +24,58 @@ PIPELINE_STEPS = [
 ]
 
 
-def run_step(step_name: str, script_path: Path) -> None:
+def parse_args() -> argparse.Namespace:
+    """Parse optional input and output paths for a pipeline run."""
+    parser = argparse.ArgumentParser(
+        description="Run the UberPulse local data pipeline."
+    )
+
+    parser.add_argument(
+        "--input",
+        type=Path,
+        default=PROJECT_ROOT
+        / "data"
+        / "raw"
+        / "yellow_tripdata_2025-01.parquet",
+        help="Path to the source Parquet file.",
+    )
+    parser.add_argument(
+        "--valid-output",
+        type=Path,
+        default=PROJECT_ROOT
+        / "data"
+        / "processed"
+        / "yellow_tripdata_2025-01_valid.parquet",
+        help="Path for validated records.",
+    )
+    parser.add_argument(
+        "--quarantine-output",
+        type=Path,
+        default=PROJECT_ROOT
+        / "data"
+        / "processed"
+        / "yellow_tripdata_2025-01_quarantine.parquet",
+        help="Path for quarantined records.",
+    )
+    parser.add_argument(
+        "--analytics-output",
+        type=Path,
+        default=PROJECT_ROOT
+        / "data"
+        / "processed"
+        / "yellow_tripdata_2025-01_analytics.parquet",
+        help="Path for transformed analytics records.",
+    )
+
+    return parser.parse_args()
+
+
+def run_step(
+    step_name: str,
+    script_path: Path,
+    extra_args: list[str] | None = None,
+) -> None:
+    """Run one pipeline script and stop if it fails."""
     print(f"\n{'=' * 70}", flush=True)
     print(f"STARTING: {step_name}", flush=True)
     print(f"Script: {script_path}", flush=True)
@@ -34,10 +86,14 @@ def run_step(step_name: str, script_path: Path) -> None:
             f"Pipeline script not found: {script_path}"
         )
 
+    command = [sys.executable, str(script_path)]
+    if extra_args:
+        command.extend(extra_args)
+
     start_time = time.perf_counter()
 
     result = subprocess.run(
-        [sys.executable, str(script_path)],
+        command,
         cwd=PROJECT_ROOT,
         check=False,
     )
@@ -58,14 +114,45 @@ def run_step(step_name: str, script_path: Path) -> None:
 
 
 def main() -> None:
-    print("UBERPULSE — LOCAL DATA PIPELINE", flush=True)
+    args = parse_args()
+
+    input_file = args.input.resolve()
+    valid_output = args.valid_output.resolve()
+    quarantine_output = args.quarantine_output.resolve()
+    analytics_output = args.analytics_output.resolve()
+
+    step_args = [
+        [
+            "--input",
+            str(input_file),
+        ],
+        [
+            "--input",
+            str(input_file),
+            "--valid-output",
+            str(valid_output),
+            "--quarantine-output",
+            str(quarantine_output),
+        ],
+        [
+            "--input",
+            str(valid_output),
+            "--output",
+            str(analytics_output),
+        ],
+    ]
+
+    print("UBERPULSE - LOCAL DATA PIPELINE", flush=True)
     print(f"Project root: {PROJECT_ROOT}", flush=True)
+    print(f"Input file: {input_file}", flush=True)
 
     pipeline_start = time.perf_counter()
 
     try:
-        for step_name, script_path in PIPELINE_STEPS:
-            run_step(step_name, script_path)
+        for (step_name, script_path), extra_args in zip(
+            PIPELINE_STEPS, step_args
+        ):
+            run_step(step_name, script_path, extra_args)
 
     except (FileNotFoundError, RuntimeError) as error:
         print(f"\nPIPELINE FAILED: {error}", flush=True)
@@ -77,21 +164,9 @@ def main() -> None:
     print("PIPELINE COMPLETED SUCCESSFULLY", flush=True)
     print(f"Total runtime: {total_elapsed:.2f} seconds", flush=True)
     print("Expected outputs:", flush=True)
-    print(
-        "  - data/processed/"
-        "yellow_tripdata_2025-01_valid.parquet",
-        flush=True,
-    )
-    print(
-        "  - data/processed/"
-        "yellow_tripdata_2025-01_quarantine.parquet",
-        flush=True,
-    )
-    print(
-        "  - data/processed/"
-        "yellow_tripdata_2025-01_analytics.parquet",
-        flush=True,
-    )
+    print(f"  - {valid_output}", flush=True)
+    print(f"  - {quarantine_output}", flush=True)
+    print(f"  - {analytics_output}", flush=True)
 
 
 if __name__ == "__main__":
